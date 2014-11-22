@@ -35,16 +35,6 @@ int write_file(const char *name, const unsigned char *content, size_t size) {
   return 0;
 }
 
-cl_int alloc_mem(void *ptr_out, size_t size) {
-  void *ptr = malloc(size);
-  if (!ptr) {
-    return CL_OUT_OF_HOST_MEMORY;
-  }
-  memset(ptr, 0, size);
-  *(void **)ptr_out = ptr;
-  return CL_SUCCESS;
-}
-
 cl_int get_platform_list(cl_platform_id **platforms_out,
                          cl_uint *num_platforms_out) {
   cl_int err;
@@ -151,19 +141,83 @@ void free_device_list(cl_device_id *devices, cl_uint num_devices) {
   free(devices);
 }
 
-cl_int compile_all_devices(unsigned *num_devices_out, const char *src,
-                           size_t src_size, cl_platform_id platform,
-                           unsigned platform_idx) {
-  cl_uint i;
+cl_int write_binaries(cl_program program, unsigned num_devices,
+                      cl_uint platform_idx) {
+  unsigned i;
   cl_int err = CL_SUCCESS;
   size_t *binaries_size = NULL;
   unsigned char **binaries_ptr = NULL;
+
+  // Read the binaries size
+  size_t binaries_size_alloc_size = sizeof(size_t) * num_devices;
+  binaries_size = (size_t *)malloc(binaries_size_alloc_size);
+  if (!binaries_size) {
+    err = CL_OUT_OF_HOST_MEMORY;
+    goto cleanup;
+  }
+
+  err = clGetProgramInfo(program, CL_PROGRAM_BINARY_SIZES,
+                         binaries_size_alloc_size, binaries_size, NULL);
+  if (err != CL_SUCCESS) {
+    goto cleanup;
+  }
+
+  // Read the binaries
+  size_t binaries_ptr_alloc_size = sizeof(unsigned char *) * num_devices;
+  binaries_ptr = (unsigned char **)malloc(binaries_ptr_alloc_size);
+  if (!binaries_ptr) {
+    err = CL_OUT_OF_HOST_MEMORY;
+    goto cleanup;
+  }
+  memset(binaries_ptr, 0, binaries_ptr_alloc_size);
+  for (i = 0; i < num_devices; ++i) {
+    binaries_ptr[i] = (unsigned char *)malloc(binaries_size[i]);
+    if (!binaries_ptr[i]) {
+      err = CL_OUT_OF_HOST_MEMORY;
+      goto cleanup;
+    }
+  }
+
+  err = clGetProgramInfo(program, CL_PROGRAM_BINARIES, binaries_ptr_alloc_size,
+                         binaries_ptr, NULL);
+  if (err != CL_SUCCESS) {
+    goto cleanup;
+  }
+
+  // Write the binaries to file
+  for (i = 0; i < num_devices; ++i) {
+    // Create output file name
+    char filename[128];
+    snprintf(filename, sizeof(filename), "cl-out_%u-%u.bin",
+             (unsigned)platform_idx, (unsigned)i);
+
+    // Write the binary to the output file
+    write_file(filename, binaries_ptr[i], binaries_size[i]);
+  }
+
+cleanup:
+  // Free the return value buffer
+  if (binaries_ptr) {
+    for (i = 0; i < num_devices; ++i) {
+      free(binaries_ptr[i]);
+    }
+    free(binaries_ptr);
+  }
+  free(binaries_size);
+
+  return err;
+}
+
+cl_int compile_program(cl_uint *num_devices_out, const char *src,
+                       size_t src_size, cl_platform_id platform,
+                       cl_uint platform_idx) {
+  cl_int err = CL_SUCCESS;
 
   // Get the device list
   cl_device_id* devices = NULL;
   cl_uint num_devices = 0;
   get_device_list(&devices, &num_devices, platform);
-  *num_devices_out = (unsigned)num_devices;
+  *num_devices_out = num_devices;
 
   // Create context
   cl_context_properties ctx_properties[] = {
@@ -188,61 +242,14 @@ cl_int compile_all_devices(unsigned *num_devices_out, const char *src,
     goto cleanup_program;
   }
 
-  // Read the binaries size
-  size_t binaries_size_alloc_size = sizeof(size_t) * num_devices;
-  err = alloc_mem(&binaries_size, binaries_size_alloc_size);
-  if (err != CL_SUCCESS) {
-    goto cleanup_program;
-  }
-
-  err = clGetProgramInfo(program, CL_PROGRAM_BINARY_SIZES,
-                         binaries_size_alloc_size, binaries_size, NULL);
-  if (err != CL_SUCCESS) {
-    goto cleanup_program;
-  }
-
-  // Read the binaries
-  size_t binaries_ptr_alloc_size = sizeof(unsigned char *) * num_devices;
-  err = alloc_mem(&binaries_ptr, binaries_ptr_alloc_size);
-  if (err != CL_SUCCESS) {
-    goto cleanup_program;
-  }
-  for (i = 0; i < num_devices; ++i) {
-    err = alloc_mem(&binaries_ptr[i], binaries_size[i]);
-    if (err != CL_SUCCESS) {
-      goto cleanup_program;
-    }
-  }
-
-  err = clGetProgramInfo(program, CL_PROGRAM_BINARIES, binaries_ptr_alloc_size,
-                         binaries_ptr, NULL);
-  if (err != CL_SUCCESS) {
-    goto cleanup_program;
-  }
-
-  // Write the binaries to file
-  for (i = 0; i < num_devices; ++i) {
-    char filename[128];
-    snprintf(filename, sizeof(filename), "cl-out_%u-%u.bin",
-             platform_idx, (unsigned)i);
-
-    write_file(filename, binaries_ptr[i], binaries_size[i]);
-  }
+  // Write the binaries
+  write_binaries(program, num_devices, platform_idx);
 
 cleanup_program:
   // Free the built program
   clReleaseProgram(program);
 
 cleanup:
-  // Free the return value buffer
-  if (binaries_ptr) {
-    for (i = 0; i < num_devices; ++i) {
-      free(binaries_ptr[i]);
-    }
-    free(binaries_ptr);
-  }
-  free(binaries_size);
-
   // Free the device list
   free_device_list(devices, num_devices);
 
@@ -262,15 +269,15 @@ void compile_all(const char *src, size_t src_size) {
   // For each platform compile binaries for each devices
   for (i = 0; i < num_platforms; ++i) {
     // Compile for each devices
-    unsigned num_devices = 0;
-    int err = compile_all_devices(&num_devices, src, src_size, platforms[i], i);
+    cl_uint num_devices = 0;
+    cl_int err = compile_program(&num_devices, src, src_size, platforms[i], i);
 
     // Print the result
     char *platform_name = get_platform_info(platforms[i], CL_PLATFORM_NAME);
     printf("PLATFORM [%s]  -->  %s (%u)\n",
            (platform_name ? platform_name : ""),
            ((err == CL_SUCCESS) ? "SUCCESS" : "FAILURE"),
-           num_devices);
+           (unsigned)num_devices);
     fflush(stdout);
     free(platform_name);
   }
