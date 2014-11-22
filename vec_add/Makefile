@@ -17,5 +17,4 @@ all: $(OUT)
 
 clean:
 	-rm *.o
-	-rm vec_add_source vec_add_binary add_s
-	-rm vec_add_spir vec_add*.spir* vec_add.bin
+	-rm $(OUT)
